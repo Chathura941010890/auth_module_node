@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inqcloud SSE Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f7f9fc;
+        }
+        .notification {
+            padding: 15px;
+            border: 1px solid #ccc;
+            border-left: 4px solid #2196F3;
+            margin-bottom: 10px;
+            background-color: #fff;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+        .notification.alert {
+            border-left-color: #f44336;
+        }
+        .notification.system {
+            border-left-color: #ff9800;
+            background-color: #fff8e1;
+        }
+        .notification .timestamp {
+            font-size: 12px;
+            color: #777;
+            margin-top: 5px;
+        }
+        #status {
+            margin-bottom: 20px;
+            padding: 10px;
+            background-color: #e8f5e9;
+            border-radius: 4px;
+            border-left: 4px solid #4CAF50;
+        }
+        #status.disconnected {
+            background-color: #ffebee;
+            border-left-color: #f44336;
+        }
+        #status.connecting {
+            background-color: #fff8e1;
+            border-left-color: #ff9800;
+        }
+        #notifications {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #eee;
+            border-radius: 4px;
+            padding: 0;
+            background-color: #fff;
+        }
+        .no-notifications {
+            padding: 20px;
+            text-align: center;
+            color: #777;
+        }
+        h1 {
+            color: #333;
+        }
+        button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .controls {
+            margin-bottom: 20px;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .status-badge.connected {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        .status-badge.disconnected {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+        .status-badge.connecting {
+            background-color: #fff8e1;
+            color: #ef6c00;
+        }
+    </style>
+</head>
+<body>
+    <h1>Inqcloud SSE Client</h1>
+    
+    <div class="controls">
+        <button id="connect">Connect</button>
+        <button id="disconnect" disabled>Disconnect</button>
+        <button id="clear">Clear Notifications</button>
+    </div>
+    
+    <div id="status">Status: Disconnected</div>
+    
+    <h2>Notifications</h2>
+    <div id="notifications">
+        <div class="no-notifications">No notifications received yet</div>
+    </div>
+    
+    <script>
+        // Store client state
+        const state = {
+            eventSource: null,
+            clientId: null,
+            connected: false,
+            reconnecting: false,
+            reconnectAttempts: 0,
+            maxReconnectAttempts: 5,
+            reconnectDelay: 2000,
+            heartbeatTimeout: null,
+            lastHeartbeat: 0,
+            heartbeatInterval: 45000, // 45 seconds (slightly longer than server's 30s)
+            unloadHandler: null
+        };
+        
+        // DOM Elements
+        const connectBtn = document.getElementById('connect');
+        const disconnectBtn = document.getElementById('disconnect');
+        const clearBtn = document.getElementById('clear');
+        const statusEl = document.getElementById('status');
+        const notificationsEl = document.getElementById('notifications');
+        
+        // Add event listeners
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        clearBtn.addEventListener('click', clearNotifications);
+        
+        // Connect to SSE
+        function connect() {
+            if (state.eventSource) {
+                return; // Already connected
+            }
+            
+            try {
+                updateStatus('Connecting...', 'connecting');
+                connectBtn.disabled = true;
+                
+                // Create EventSource
+                state.eventSource = new EventSource('/auth/api/v1/sse/connect');
+                
+                // Set up event listeners
+                state.eventSource.addEventListener('open', handleOpen);
+                state.eventSource.addEventListener('error', handleError);
+                state.eventSource.addEventListener('message', handleMessage);
+                state.eventSource.addEventListener('connection', handleConnection);
+                state.eventSource.addEventListener('disconnect', handleDisconnect);
+                
+                // Set up unload handler
+                state.unloadHandler = beforeUnloadHandler;
+                window.addEventListener('beforeunload', state.unloadHandler);
+                
+                // Start heartbeat check
+                startHeartbeatCheck();
+            } catch (error) {
+                console.error('Error connecting to SSE:', error);
+                updateStatus(`Connection error: ${error.message}`, 'disconnected');
+                resetConnection();
+            }
+        }
+        
+        // Handle successful connection
+        function handleOpen(event) {
+            state.reconnectAttempts = 0;
+            state.connected = true;
+            disconnectBtn.disabled = false;
+        }
+        
+        // Handle connection event (get client ID)
+        function handleConnection(event) {
+            try {
+                const data = JSON.parse(event.data);
+                state.clientId = data.clientId;
+                
+                updateStatus(`Connected (ID: ${state.clientId})`, 'connected');
+                addNotification({
+                    type: 'system',
+                    message: `Connected to SSE server with client ID: ${state.clientId}`,
+                    timestamp: new Date().toISOString()
+                });
+                
+                console.log('Connected to SSE with client ID:', state.clientId);
+            } catch (error) {
+                console.error('Error handling connection event:', error);
+            }
+        }
+        
+        // Handle disconnect event
+        function handleDisconnect(event) {
+            try {
+                const data = JSON.parse(event.data);
+                
+                addNotification({
+                    type: 'system',
+                    message: `Disconnected from SSE server: ${data.reason || 'No reason provided'}`,
+                    timestamp: new Date().toISOString()
+                });
+                
+                resetConnection();
+            } catch (error) {
+                console.error('Error handling disconnect event:', error);
+                resetConnection();
+            }
+        }
+        
+        // Handle regular messages
+        function handleMessage(event) {
+            try {
+                // Reset heartbeat timer as we've received data
+                resetHeartbeatTimer();
+                
+                // Handle message
+                const data = JSON.parse(event.data);
+                
+                addNotification({
+                    type: data.type || 'message',
+                    message: data.message,
+                    timestamp: data.timestamp || new Date().toISOString()
+                });
+            } catch (error) {
+                console.error('Error handling message:', error);
+            }
+        }
+        
+        // Handle connection errors
+        function handleError(event) {
+            // The browser will attempt to reconnect automatically
+            // but we should update the UI to reflect the connection state
+            state.connected = false;
+            updateStatus('Connection error, reconnecting...', 'connecting');
+            
+            // If we've tried too many times, give up
+            state.reconnectAttempts++;
+            if (state.reconnectAttempts > state.maxReconnectAttempts) {
+                console.error('Max reconnection attempts reached');
+                resetConnection();
+                updateStatus('Failed to connect after several attempts', 'disconnected');
+            }
+        }
+        
+        // Manual disconnect
+        function disconnect() {
+            if (!state.eventSource || !state.connected) {
+                return;
+            }
+            
+            // If we have a client ID, tell the server to disconnect us
+            if (state.clientId) {
+                fetch(`/status/sse/disconnect/${state.clientId}`, {
+                    method: 'POST',
+                    keepalive: true
+                }).catch(error => {
+                    console.error('Error sending disconnect request:', error);
+                });
+            }
+            
+            // Clean up locally
+            resetConnection();
+            addNotification({
+                type: 'system',
+                message: 'Manually disconnected from SSE server',
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        // Reset connection state
+        function resetConnection() {
+            // Clear heartbeat check
+            if (state.heartbeatTimeout) {
+                clearTimeout(state.heartbeatTimeout);
+                state.heartbeatTimeout = null;
+            }
+            
+            // Remove unload handler
+            if (state.unloadHandler) {
+                window.removeEventListener('beforeunload', state.unloadHandler);
+                state.unloadHandler = null;
+            }
+            
+            // Close EventSource
+            if (state.eventSource) {
+                state.eventSource.close();
+                state.eventSource = null;
+            }
+            
+            // Reset state
+            state.connected = false;
+            
+            // Update UI
+            updateStatus('Disconnected', 'disconnected');
+            connectBtn.disabled = false;
+            disconnectBtn.disabled = true;
+        }
+        
+        // Start heartbeat check
+        function startHeartbeatCheck() {
+            state.lastHeartbeat = Date.now();
+            checkHeartbeat();
+        }
+        
+        // Check heartbeat and reconnect if needed
+        function checkHeartbeat() {
+            const now = Date.now();
+            const timeSinceHeartbeat = now - state.lastHeartbeat;
+            
+            if (timeSinceHeartbeat > state.heartbeatInterval && state.connected) {
+                console.warn('No heartbeat received, reconnecting...');
+                addNotification({
+                    type: 'system',
+                    message: 'Connection timeout - no heartbeat received',
+                    timestamp: new Date().toISOString()
+                });
+                
+                // Connection likely dead, reset and reconnect
+                resetConnection();
+                
+                // Try to reconnect after a delay
+                setTimeout(connect, state.reconnectDelay);
+            }
+            
+            // Schedule next check
+            state.heartbeatTimeout = setTimeout(checkHeartbeat, 5000);
+        }
+        
+        // Reset heartbeat timer when data is received
+        function resetHeartbeatTimer() {
+            state.lastHeartbeat = Date.now();
+        }
+        
+        // Handle before unload (browser close/navigation)
+        function beforeUnloadHandler() {
+            // Send disconnect request if we have a client ID
+            if (state.clientId) {
+                navigator.sendBeacon(`/status/sse/disconnect/${state.clientId}`);
+            }
+            
+            // No need to show a confirmation dialog
+            // Just clean up the connection
+            resetConnection();
+        }
+        
+        // Add a notification to the UI
+        function addNotification(data) {
+            // Remove "no notifications" message if present
+            const noNotifications = notificationsEl.querySelector('.no-notifications');
+            if (noNotifications) {
+                notificationsEl.removeChild(noNotifications);
+            }
+            
+            // Create notification element
+            const notif = document.createElement('div');
+            notif.className = `notification ${data.type === 'alert' ? 'alert' : ''} ${data.type === 'system' ? 'system' : ''}`;
+            
+            // Create message
+            const message = document.createElement('div');
+            message.className = 'message';
+            message.textContent = data.message;
+            notif.appendChild(message);
+            
+            // Create timestamp
+            const timestamp = document.createElement('div');
+            timestamp.className = 'timestamp';
+            timestamp.textContent = new Date(data.timestamp).toLocaleTimeString();
+            notif.appendChild(timestamp);
+            
+            // Add to container
+            notificationsEl.appendChild(notif);
+            
+            // Scroll to bottom
+            notificationsEl.scrollTop = notificationsEl.scrollHeight;
+        }
+        
+        // Update status display
+        function updateStatus(message, state) {
+            statusEl.textContent = `Status: ${message}`;
+            statusEl.className = state || '';
+        }
+        
+        // Clear all notifications
+        function clearNotifications() {
+            notificationsEl.innerHTML = '<div class="no-notifications">No notifications received yet</div>';
+        }
+    </script>
+</body>
+</html>
